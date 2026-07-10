@@ -1,18 +1,32 @@
 # 导入所需的库
-from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import streamlit as st
+import os
 
-from modelscope import snapshot_download
+# from modelscope import snapshot_download
+
+
+# 检测设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+device_dtype = torch.bfloat16 if device == "cuda" else torch.float16
+
+# CPU 线程优化：使用多核加速推理
+if device == "cpu":
+    num_threads = min(os.cpu_count() or 4, 8)
+    torch.set_num_threads(num_threads)
+    print(f"[CPU 优化] 已设置 {num_threads} 个线程用于推理")
 
 # 在侧边栏中创建一个标题和一个链接
 with st.sidebar:
     st.markdown("## InternLM LLM")
+    st.caption(f"当前运行设备: **{device.upper()}** {'⚠️ CPU 速度较慢，请耐心等待' if device == 'cpu' else ''}")
     "[InternLM](https://github.com/InternLM/InternLM.git)"
     "[开源大模型食用指南 self-llm](https://github.com/datawhalechina/self-llm.git)"
     "[Chat嬛嬛](https://github.com/KMnO4-zx/huanhuan-chat.git)"
-    # 创建一个滑块，用于选择最大长度，范围在0到1024之间，默认值为512
-    max_length = st.slider("max_length", 0, 1024, 512, step=1)
+    # 创建一个滑块，用于选择最大生成长度，默认值降低到256以加快CPU响应
+    max_length = st.slider("max_new_tokens", 32, 1024, 256, step=32,
+                           help="每次回复最多生成的 token 数量，值越小速度越快")
     system_prompt = st.text_input("System_Prompt", "现在你要扮演皇帝身边的女人--甄嬛")
 
 # 创建一个标题和一个副标题
@@ -21,10 +35,12 @@ st.caption("🚀 A streamlit chatbot powered by InternLM2 QLora")
 
 # 定义模型路径
 
-model_id = 'kmno4zx/huanhuan-chat-internlm2'
+# 本地模型路径（已下载完成）
+mode_name_or_path = "./models/kmno4zx--huanhuan-chat-internlm2/snapshots/master"
 
-mode_name_or_path = snapshot_download(model_id, revision='master')
-
+# 以下为在线下载方式，已注释
+# model_id = 'kmno4zx/huanhuan-chat-internlm2'
+# mode_name_or_path = snapshot_download(model_id, revision='master', cache_dir='./')
 
 # 定义一个函数，用于获取模型和tokenizer
 @st.cache_resource
@@ -32,12 +48,24 @@ def get_model():
     # 从预训练的模型中获取tokenizer
     tokenizer = AutoTokenizer.from_pretrained(mode_name_or_path, trust_remote_code=True)
     # 从预训练的模型中获取模型，并设置模型参数
-    model = AutoModelForCausalLM.from_pretrained(mode_name_or_path, trust_remote_code=True, torch_dtype=torch.bfloat16).cuda()
-    model.eval()  
+    model = AutoModelForCausalLM.from_pretrained(
+        mode_name_or_path,
+        trust_remote_code=True,
+        dtype=device_dtype,
+        device_map=device,
+        low_cpu_mem_usage=True,
+    )
+    model.eval()
     return tokenizer, model
 
-# 加载Chatglm3的model和tokenizer
-tokenizer, model = get_model()
+# 加载模型（首次加载较慢，后续 Streamlit rerun 会使用缓存）
+with st.spinner("正在加载模型，请耐心等待..."):
+    tokenizer, model = get_model()
+
+# 禁用 KV Cache，避免 DynamicCache 与自定义模型代码的兼容性问题
+model.config.use_cache = False
+if model.generation_config is not None:
+    model.generation_config.use_cache = False
 
 # 如果session_state中没有"messages"，则创建一个包含默认消息的列表
 if "messages" not in st.session_state:
@@ -52,9 +80,24 @@ for msg in st.session_state.messages:
 if prompt := st.chat_input():
     # 在聊天界面上显示用户的输入
     st.chat_message("user").write(prompt)
-    # 构建输入     
-    response, history = model.chat(tokenizer, prompt, meta_instruction=system_prompt, history=st.session_state.messages)
+
+    # 使用流式输出生成回复（逐token显示，提升CPU模式下的用户体验）
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        with st.spinner("思考中..."):
+            response_text = ""
+            # stream_chat 是生成器，每生成一个 token 就会 yield 一次
+            for chunk, history in model.stream_chat(
+                tokenizer,
+                prompt,
+                history=st.session_state.messages,
+                meta_instruction=system_prompt,
+                max_new_tokens=max_length,
+            ):
+                response_text = chunk
+                message_placeholder.markdown(response_text + "▌")
+        # 去掉光标符号，显示最终结果
+        message_placeholder.markdown(response_text)
+
     # 将模型的输出添加到session_state中的messages列表中
-    st.session_state.messages.append((prompt, response))
-    # 在聊天界面上显示模型的输出
-    st.chat_message("assistant").write(response)
+    st.session_state.messages.append((prompt, response_text))
