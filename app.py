@@ -1,20 +1,28 @@
+# Python 3.12+ 兼容性补丁：恢复已移除的 ast 属性
+import ast
+for _attr in ("Str", "Num", "Bytes", "NameConstant", "Ellipsis"):
+    if not hasattr(ast, _attr):
+        setattr(ast, _attr, ast.Constant)
+
 # 导入所需的库
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import streamlit as st
 import os
 
-# from modelscope import snapshot_download
-
-
 # 检测设备
 device = "cuda" if torch.cuda.is_available() else "cpu"
-device_dtype = torch.bfloat16 if device == "cuda" else torch.float16
+
+# CPU 推理必须用 float32，float16 在 x86 CPU 上非常慢（无原生支持）
+device_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
 # CPU 线程优化：使用多核加速推理
 if device == "cpu":
-    num_threads = min(os.cpu_count() or 4, 8)
+    num_threads = os.cpu_count() or 8  # 不设上限，全核投入
     torch.set_num_threads(num_threads)
+    # 同时设置 OpenMP/MKL 线程数（部分 PyTorch 版本需要手动设）
+    os.environ["OMP_NUM_THREADS"] = str(num_threads)
+    os.environ["MKL_NUM_THREADS"] = str(num_threads)
     print(f"[CPU 优化] 已设置 {num_threads} 个线程用于推理")
 
 # 在侧边栏中创建一个标题和一个链接
@@ -30,17 +38,15 @@ with st.sidebar:
     system_prompt = st.text_input("System_Prompt", "现在你要扮演皇帝身边的女人--甄嬛")
 
 # 创建一个标题和一个副标题
-st.title("💬 InternLM2-Chat-7B 嬛嬛版")
+st.title("💬 InternLM2-Chat-1.8B 嬛嬛版")
 st.caption("🚀 A streamlit chatbot powered by InternLM2 QLora")
 
 # 定义模型路径
 
 # 本地模型路径（已下载完成）
-mode_name_or_path = "./models/kmno4zx--huanhuan-chat-internlm2/snapshots/master"
-
-# 以下为在线下载方式，已注释
-# model_id = 'kmno4zx/huanhuan-chat-internlm2'
-# mode_name_or_path = snapshot_download(model_id, revision='master', cache_dir='./')
+# # 本地模型路径（1.8B 版本，CPU 推理更快；如需切回 7B，改为下面注释的路径）
+mode_name_or_path = "./models/kmno4zx--huanhuan-chat-internlm2-1_8b/snapshots/master"
+# mode_name_or_path = "./models/kmno4zx--huanhuan-chat-internlm2/snapshots/master"  # 7B 版本
 
 # 定义一个函数，用于获取模型和tokenizer
 @st.cache_resource
@@ -51,7 +57,7 @@ def get_model():
     model = AutoModelForCausalLM.from_pretrained(
         mode_name_or_path,
         trust_remote_code=True,
-        dtype=device_dtype,
+        torch_dtype=device_dtype,
         device_map=device,
         low_cpu_mem_usage=True,
     )
@@ -61,11 +67,6 @@ def get_model():
 # 加载模型（首次加载较慢，后续 Streamlit rerun 会使用缓存）
 with st.spinner("正在加载模型，请耐心等待..."):
     tokenizer, model = get_model()
-
-# 禁用 KV Cache，避免 DynamicCache 与自定义模型代码的兼容性问题
-model.config.use_cache = False
-if model.generation_config is not None:
-    model.generation_config.use_cache = False
 
 # 如果session_state中没有"messages"，则创建一个包含默认消息的列表
 if "messages" not in st.session_state:
